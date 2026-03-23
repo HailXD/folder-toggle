@@ -56,6 +56,8 @@ NO_EXTENSION_LABEL = "[no ext]"
 REPO_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 GITIGNORE_FILE_NAME = ".gitignore"
 GITIGNORE_WILDCARD_PREFIX = "*"
+NODE_MODULES_IGNORE_PATTERN = "node_modules/"
+PYC_IGNORE_PATTERN = "*.pyc"
 
 
 @dataclass(slots=True)
@@ -218,6 +220,7 @@ class FolderToggleWindow(QWidget):
         self.normalize_names_button = QPushButton("Normalize Names")
         self.create_repos_button = QPushButton("Create Repos")
         self.edit_gitignore_button = QPushButton("Edit .gitignore")
+        self.add_common_ignores_button = QPushButton("Add node_modules and *.pyc")
         self.sort_combo = QComboBox()
         self._build_ui()
         self._load_items()
@@ -303,6 +306,7 @@ class FolderToggleWindow(QWidget):
         utility_row.addWidget(self.normalize_names_button)
         utility_row.addWidget(self.create_repos_button)
         utility_row.addWidget(self.edit_gitignore_button)
+        utility_row.addWidget(self.add_common_ignores_button)
         utility_row.addWidget(QLabel("Sort"))
         self.sort_combo.addItems(
             [
@@ -333,6 +337,7 @@ class FolderToggleWindow(QWidget):
         self.normalize_names_button.clicked.connect(self._normalize_folder_names)
         self.create_repos_button.clicked.connect(self._create_repos)
         self.edit_gitignore_button.clicked.connect(self._edit_selected_gitignore)
+        self.add_common_ignores_button.clicked.connect(self._add_common_ignores)
         self.sort_combo.currentTextChanged.connect(self._apply_sort)
         self.table_widget.itemChanged.connect(self._handle_item_changed)
         self.table_widget.cellDoubleClicked.connect(self._handle_cell_double_clicked)
@@ -743,6 +748,34 @@ class FolderToggleWindow(QWidget):
             )
         self._refresh_row(folder_name)
 
+    def _add_common_ignores(self) -> None:
+        updated_folders: list[str] = []
+        added_patterns = 0
+        for folder_path in get_current_folders():
+            patterns = get_present_common_ignore_patterns(folder_path)
+            if not patterns:
+                continue
+            folder_updated = False
+            for pattern in patterns:
+                if add_gitignore_pattern(folder_path, pattern):
+                    added_patterns += 1
+                    folder_updated = True
+            if folder_updated:
+                updated_folders.append(folder_path.name)
+                self._refresh_row(folder_path.name)
+
+        if not updated_folders:
+            message = "No folders needed node_modules/ or *.pyc added."
+            QMessageBox.information(self, WINDOW_TITLE, message)
+            self.activity_label.setText(message)
+            return
+
+        message = (
+            f"Updated {len(updated_folders)} folders with {added_patterns} ignore patterns."
+        )
+        QMessageBox.information(self, WINDOW_TITLE, message)
+        self.activity_label.setText(message)
+
     def _refresh_row(self, folder_name: str) -> None:
         row = self._find_row(folder_name)
         if row is None:
@@ -982,6 +1015,30 @@ def read_gitignore_lines(folder_path: Path) -> list[str]:
 
 def build_extension_ignore_pattern(file_type: str) -> str:
     return f"{GITIGNORE_WILDCARD_PREFIX}{file_type}"
+
+
+def get_present_common_ignore_patterns(folder_path: Path) -> list[str]:
+    has_node_modules = False
+    has_pyc = False
+    for current_root, dir_names, file_names in os.walk(folder_path):
+        if "node_modules" in dir_names:
+            has_node_modules = True
+        dir_names[:] = [
+            dir_name
+            for dir_name in dir_names
+            if dir_name not in EXCLUDED_SCAN_DIR_NAMES and dir_name != "node_modules"
+        ]
+        if not has_pyc and any(file_name.endswith(".pyc") for file_name in file_names):
+            has_pyc = True
+        if has_node_modules and has_pyc:
+            break
+
+    patterns: list[str] = []
+    if has_node_modules:
+        patterns.append(NODE_MODULES_IGNORE_PATTERN)
+    if has_pyc:
+        patterns.append(PYC_IGNORE_PATTERN)
+    return patterns
 
 
 def load_gitignore_rules(folder_path: Path) -> list[IgnoreRule]:
