@@ -1,19 +1,25 @@
+import html
 import os
 import re
 import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Iterable
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -30,18 +36,26 @@ WINDOW_WIDTH = 960
 WINDOW_HEIGHT = 640
 DEFAULT_BRANCH_NAME = "main"
 INIT_COMMIT_MESSAGE = "init"
-GH_REPO_VISIBILITY_FLAG = "--private"
+REPO_VISIBILITY_PRIVATE = "private"
+REPO_VISIBILITY_PUBLIC = "public"
+REPO_VISIBILITY_VALUES = [REPO_VISIBILITY_PRIVATE, REPO_VISIBILITY_PUBLIC]
 FOLDER_COLUMN = 0
 SIZE_COLUMN = 1
-TYPE_COLUMN = 2
+FILTERED_SIZE_COLUMN = 2
+TYPE_COLUMN = 3
+REPO_COLUMN = 4
 SORT_NAME_ASC = "Name (A-Z)"
 SORT_NAME_DESC = "Name (Z-A)"
 SORT_SIZE_DESC = "Size (Largest)"
 SORT_SIZE_ASC = "Size (Smallest)"
+SORT_FILTERED_SIZE_DESC = "Filtered Size (Largest)"
+SORT_FILTERED_SIZE_ASC = "Filtered Size (Smallest)"
 EXCLUDED_FOLDER_NAMES = {".git", "__pycache__"}
 EXCLUDED_SCAN_DIR_NAMES = {".git", "__pycache__"}
 NO_EXTENSION_LABEL = "[no ext]"
 REPO_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+GITIGNORE_FILE_NAME = ".gitignore"
+GITIGNORE_WILDCARD_PREFIX = "*"
 
 
 @dataclass(slots=True)
@@ -49,6 +63,21 @@ class RepoResult:
     name: str
     status: str
     details: str
+
+
+@dataclass(slots=True)
+class FolderMetrics:
+    total_size: int
+    filtered_size: int
+    top_types: list[tuple[str, int]]
+
+
+@dataclass(slots=True)
+class IgnoreRule:
+    pattern: str
+    negated: bool
+    directory_only: bool
+    rooted: bool
 
 
 class SortableTableWidgetItem(QTableWidgetItem):
@@ -73,10 +102,25 @@ class FolderStore:
             f"""
             CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
                 name TEXT PRIMARY KEY,
-                enabled INTEGER NOT NULL CHECK(enabled IN (0, 1))
+                enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                repo_visibility TEXT NOT NULL DEFAULT '{REPO_VISIBILITY_PRIVATE}'
+                    CHECK(repo_visibility IN ('{REPO_VISIBILITY_PRIVATE}', '{REPO_VISIBILITY_PUBLIC}'))
             )
             """
         )
+        columns = {
+            row["name"]
+            for row in self.connection.execute(
+                f"PRAGMA table_info({TABLE_NAME})"
+            ).fetchall()
+        }
+        if "repo_visibility" not in columns:
+            self.connection.execute(
+                f"""
+                ALTER TABLE {TABLE_NAME}
+                ADD COLUMN repo_visibility TEXT NOT NULL DEFAULT '{REPO_VISIBILITY_PRIVATE}'
+                """
+            )
         self.connection.commit()
 
     def seed_if_empty(self, folder_names: Iterable[str]) -> None:
@@ -94,11 +138,17 @@ class FolderStore:
         ).fetchone()
         return bool(row[0])
 
-    def fetch_all(self) -> list[tuple[str, bool]]:
+    def fetch_all(self) -> list[tuple[str, bool, str]]:
         rows = self.connection.execute(
-            f"SELECT name, enabled FROM {TABLE_NAME} ORDER BY LOWER(name), name"
+            f"""
+            SELECT name, enabled, repo_visibility
+            FROM {TABLE_NAME}
+            ORDER BY LOWER(name), name
+            """
         ).fetchall()
-        return [(row["name"], bool(row["enabled"])) for row in rows]
+        return [
+            (row["name"], bool(row["enabled"]), row["repo_visibility"]) for row in rows
+        ]
 
     def sync_folder_names(self, folder_names: Iterable[str]) -> None:
         current_names = set(folder_names)
@@ -135,6 +185,13 @@ class FolderStore:
         )
         self.connection.commit()
 
+    def set_repo_visibility(self, name: str, repo_visibility: str) -> None:
+        self.connection.execute(
+            f"UPDATE {TABLE_NAME} SET repo_visibility = ? WHERE name = ?",
+            (repo_visibility, name),
+        )
+        self.connection.commit()
+
     def rename_folder(self, old_name: str, new_name: str) -> None:
         self.connection.execute(
             f"UPDATE {TABLE_NAME} SET name = ? WHERE name = ?",
@@ -160,6 +217,7 @@ class FolderToggleWindow(QWidget):
         self.refresh_button = QPushButton("Refresh")
         self.normalize_names_button = QPushButton("Normalize Names")
         self.create_repos_button = QPushButton("Create Repos")
+        self.edit_gitignore_button = QPushButton("Edit .gitignore")
         self.sort_combo = QComboBox()
         self._build_ui()
         self._load_items()
@@ -219,8 +277,10 @@ class FolderToggleWindow(QWidget):
             """
         )
 
-        self.table_widget.setColumnCount(3)
-        self.table_widget.setHorizontalHeaderLabels(["Folder", "Size", "Top File Types"])
+        self.table_widget.setColumnCount(5)
+        self.table_widget.setHorizontalHeaderLabels(
+            ["Folder", "Size", "Filtered Size", "Top File Types", "Repo"]
+        )
         self.table_widget.verticalHeader().setVisible(False)
         self.table_widget.setSortingEnabled(True)
         self.table_widget.setSelectionBehavior(
@@ -242,9 +302,17 @@ class FolderToggleWindow(QWidget):
         utility_row.addWidget(self.refresh_button)
         utility_row.addWidget(self.normalize_names_button)
         utility_row.addWidget(self.create_repos_button)
+        utility_row.addWidget(self.edit_gitignore_button)
         utility_row.addWidget(QLabel("Sort"))
         self.sort_combo.addItems(
-            [SORT_NAME_ASC, SORT_NAME_DESC, SORT_SIZE_DESC, SORT_SIZE_ASC]
+            [
+                SORT_NAME_ASC,
+                SORT_NAME_DESC,
+                SORT_SIZE_DESC,
+                SORT_SIZE_ASC,
+                SORT_FILTERED_SIZE_DESC,
+                SORT_FILTERED_SIZE_ASC,
+            ]
         )
         utility_row.addWidget(self.sort_combo)
 
@@ -264,8 +332,10 @@ class FolderToggleWindow(QWidget):
         self.refresh_button.clicked.connect(self._refresh_items)
         self.normalize_names_button.clicked.connect(self._normalize_folder_names)
         self.create_repos_button.clicked.connect(self._create_repos)
+        self.edit_gitignore_button.clicked.connect(self._edit_selected_gitignore)
         self.sort_combo.currentTextChanged.connect(self._apply_sort)
         self.table_widget.itemChanged.connect(self._handle_item_changed)
+        self.table_widget.cellDoubleClicked.connect(self._handle_cell_double_clicked)
 
     def _load_items(self) -> None:
         self.is_updating = True
@@ -273,9 +343,16 @@ class FolderToggleWindow(QWidget):
         self.table_widget.setRowCount(0)
         folder_paths = get_current_folders()
         self.store.sync_folder_names(path.name for path in folder_paths)
-        enabled_by_name = dict(self.store.fetch_all())
+        folder_rows = self.store.fetch_all()
+        enabled_by_name = {
+            name: enabled for name, enabled, _repo_visibility in folder_rows
+        }
+        visibility_by_name = {
+            name: repo_visibility
+            for name, _enabled, repo_visibility in folder_rows
+        }
         for folder_path in folder_paths:
-            total_size, top_types = get_folder_size_details(folder_path)
+            metrics = get_folder_metrics(folder_path)
             row_index = self.table_widget.rowCount()
             self.table_widget.insertRow(row_index)
 
@@ -294,22 +371,27 @@ class FolderToggleWindow(QWidget):
             folder_item.setData(Qt.ItemDataRole.UserRole, folder_path.name)
             self.table_widget.setItem(row_index, FOLDER_COLUMN, folder_item)
 
-            size_item = SortableTableWidgetItem(format_size(total_size))
-            size_item.setData(Qt.ItemDataRole.UserRole, total_size)
-            size_item.setFlags(
-                (size_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
+            self.table_widget.setItem(
+                row_index, SIZE_COLUMN, create_size_item(metrics.total_size)
             )
-            self.table_widget.setItem(row_index, SIZE_COLUMN, size_item)
-
-            type_item = QTableWidgetItem(format_top_types(total_size, top_types))
-            type_item.setFlags(
-                (type_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
+            self.table_widget.setItem(
+                row_index,
+                FILTERED_SIZE_COLUMN,
+                create_size_item(metrics.filtered_size),
             )
-            self.table_widget.setItem(row_index, TYPE_COLUMN, type_item)
+            self.table_widget.setCellWidget(
+                row_index,
+                TYPE_COLUMN,
+                self._create_top_types_label(folder_path, metrics),
+            )
+            self.table_widget.setCellWidget(
+                row_index,
+                REPO_COLUMN,
+                self._create_repo_visibility_combo(
+                    folder_path.name,
+                    visibility_by_name.get(folder_path.name, REPO_VISIBILITY_PRIVATE),
+                ),
+            )
 
         self.is_updating = False
         self.table_widget.setSortingEnabled(True)
@@ -327,8 +409,16 @@ class FolderToggleWindow(QWidget):
             int(self.table_widget.item(index, SIZE_COLUMN).data(Qt.ItemDataRole.UserRole))
             for index in range(self.table_widget.rowCount())
         )
+        filtered_total_size = sum(
+            int(
+                self.table_widget.item(index, FILTERED_SIZE_COLUMN).data(
+                    Qt.ItemDataRole.UserRole
+                )
+            )
+            for index in range(self.table_widget.rowCount())
+        )
         self.status_label.setText(
-            f"{enabled_count} enabled / {item_count} folders   {format_size(total_size)} total   DB: {DB_PATH.name}"
+            f"{enabled_count} enabled / {item_count} folders   {format_size(total_size)} total   {format_size(filtered_total_size)} filtered   DB: {DB_PATH.name}"
         )
 
     def _set_all_items(self, enabled: bool) -> None:
@@ -383,6 +473,14 @@ class FolderToggleWindow(QWidget):
             self.table_widget.sortItems(FOLDER_COLUMN, Qt.SortOrder.DescendingOrder)
         elif sort_choice == SORT_SIZE_ASC:
             self.table_widget.sortItems(SIZE_COLUMN, Qt.SortOrder.AscendingOrder)
+        elif sort_choice == SORT_FILTERED_SIZE_DESC:
+            self.table_widget.sortItems(
+                FILTERED_SIZE_COLUMN, Qt.SortOrder.DescendingOrder
+            )
+        elif sort_choice == SORT_FILTERED_SIZE_ASC:
+            self.table_widget.sortItems(
+                FILTERED_SIZE_COLUMN, Qt.SortOrder.AscendingOrder
+            )
         else:
             self.table_widget.sortItems(SIZE_COLUMN, Qt.SortOrder.DescendingOrder)
 
@@ -478,7 +576,7 @@ class FolderToggleWindow(QWidget):
             self,
             WINDOW_TITLE,
             (
-                f"Create private GitHub repos for {len(folder_paths)} folders, "
+                f"Create GitHub repos for {len(folder_paths)} folders using each row's visibility setting, "
                 f"initialize git where needed, and push an '{INIT_COMMIT_MESSAGE}' commit?"
             ),
         )
@@ -486,9 +584,17 @@ class FolderToggleWindow(QWidget):
             return
 
         results: list[RepoResult] = []
+        repo_visibility_by_name = self._get_repo_visibility_by_name()
         for folder_path in folder_paths:
             QApplication.processEvents()
-            results.append(self._create_repo_for_folder(folder_path))
+            results.append(
+                self._create_repo_for_folder(
+                    folder_path,
+                    repo_visibility_by_name.get(
+                        folder_path.name, REPO_VISIBILITY_PRIVATE
+                    ),
+                )
+            )
 
         created_count = sum(result.status == "created" for result in results)
         pushed_count = sum(result.status == "pushed" for result in results)
@@ -508,7 +614,9 @@ class FolderToggleWindow(QWidget):
         self.activity_label.setText(summary)
         self._load_items()
 
-    def _create_repo_for_folder(self, folder_path: Path) -> RepoResult:
+    def _create_repo_for_folder(
+        self, folder_path: Path, repo_visibility: str
+    ) -> RepoResult:
         try:
             if not (folder_path / ".git").exists():
                 run_command(["git", "init", "-b", DEFAULT_BRANCH_NAME], folder_path)
@@ -536,7 +644,7 @@ class FolderToggleWindow(QWidget):
                         "repo",
                         "create",
                         folder_path.name,
-                        GH_REPO_VISIBILITY_FLAG,
+                        get_repo_visibility_flag(repo_visibility),
                         "--source",
                         ".",
                         "--remote",
@@ -548,7 +656,7 @@ class FolderToggleWindow(QWidget):
                 return RepoResult(
                     folder_path.name,
                     "created",
-                    "private repo created and pushed",
+                    f"{repo_visibility} repo created and pushed",
                 )
 
             branch_name = get_current_branch_name(folder_path)
@@ -562,6 +670,165 @@ class FolderToggleWindow(QWidget):
             return RepoResult(folder_path.name, "pushed", f"pushed {branch_name}")
         except RuntimeError as error:
             return RepoResult(folder_path.name, "failed", str(error))
+
+    def _create_repo_visibility_combo(
+        self, folder_name: str, repo_visibility: str
+    ) -> QComboBox:
+        combo_box = QComboBox()
+        combo_box.addItems(REPO_VISIBILITY_VALUES)
+        combo_box.setCurrentText(repo_visibility)
+        combo_box.setProperty("folder_name", folder_name)
+        combo_box.currentTextChanged.connect(self._handle_repo_visibility_changed)
+        return combo_box
+
+    def _create_top_types_label(
+        self, folder_path: Path, metrics: FolderMetrics
+    ) -> QLabel:
+        label = QLabel(format_top_types_html(metrics.total_size, metrics.top_types))
+        label.setProperty("folder_name", folder_path.name)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        label.setOpenExternalLinks(False)
+        label.linkActivated.connect(
+            lambda file_type, folder_name=folder_path.name: self._ignore_file_type(
+                folder_name, file_type
+            )
+        )
+        return label
+
+    def _handle_repo_visibility_changed(self, repo_visibility: str) -> None:
+        combo_box = self.sender()
+        if not isinstance(combo_box, QComboBox):
+            return
+        folder_name = combo_box.property("folder_name")
+        if not isinstance(folder_name, str):
+            return
+        self.store.set_repo_visibility(folder_name, repo_visibility)
+        self.activity_label.setText(f"{folder_name} repo visibility set to {repo_visibility}")
+
+    def _handle_cell_double_clicked(self, row: int, column: int) -> None:
+        if column != TYPE_COLUMN:
+            return
+        folder_item = self.table_widget.item(row, FOLDER_COLUMN)
+        if folder_item is None:
+            return
+        self._edit_gitignore(folder_item.data(Qt.ItemDataRole.UserRole))
+
+    def _edit_selected_gitignore(self) -> None:
+        folder_name = self._get_selected_folder_name()
+        if folder_name is None:
+            QMessageBox.information(
+                self, WINDOW_TITLE, "Select a folder to edit its .gitignore."
+            )
+            return
+        self._edit_gitignore(folder_name)
+
+    def _edit_gitignore(self, folder_name: str) -> None:
+        folder_path = APP_DIR / folder_name
+        dialog = GitIgnoreDialog(folder_path, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        write_gitignore_text(folder_path, dialog.get_text())
+        self._refresh_row(folder_name)
+        self.activity_label.setText(f"Saved {folder_name}\\{GITIGNORE_FILE_NAME}")
+
+    def _ignore_file_type(self, folder_name: str, file_type: str) -> None:
+        if not file_type.startswith("."):
+            return
+        ignore_pattern = build_extension_ignore_pattern(file_type)
+        if add_gitignore_pattern(APP_DIR / folder_name, ignore_pattern):
+            self.activity_label.setText(f"Added {ignore_pattern} to {folder_name}\\{GITIGNORE_FILE_NAME}")
+        else:
+            self.activity_label.setText(
+                f"{ignore_pattern} already exists in {folder_name}\\{GITIGNORE_FILE_NAME}"
+            )
+        self._refresh_row(folder_name)
+
+    def _refresh_row(self, folder_name: str) -> None:
+        row = self._find_row(folder_name)
+        if row is None:
+            self._load_items()
+            return
+        folder_path = APP_DIR / folder_name
+        if not folder_path.is_dir():
+            self._load_items()
+            return
+        metrics = get_folder_metrics(folder_path)
+        self.is_updating = True
+        self.table_widget.item(row, SIZE_COLUMN).setText(format_size(metrics.total_size))
+        self.table_widget.item(row, SIZE_COLUMN).setData(
+            Qt.ItemDataRole.UserRole, metrics.total_size
+        )
+        self.table_widget.item(row, FILTERED_SIZE_COLUMN).setText(
+            format_size(metrics.filtered_size)
+        )
+        self.table_widget.item(row, FILTERED_SIZE_COLUMN).setData(
+            Qt.ItemDataRole.UserRole, metrics.filtered_size
+        )
+        type_label = self.table_widget.cellWidget(row, TYPE_COLUMN)
+        if isinstance(type_label, QLabel):
+            type_label.setText(format_top_types_html(metrics.total_size, metrics.top_types))
+        self.is_updating = False
+        self._apply_sort()
+        self._update_status_label()
+
+    def _find_row(self, folder_name: str) -> int | None:
+        for row in range(self.table_widget.rowCount()):
+            folder_item = self.table_widget.item(row, FOLDER_COLUMN)
+            if folder_item is None:
+                continue
+            if folder_item.data(Qt.ItemDataRole.UserRole) == folder_name:
+                return row
+        return None
+
+    def _get_selected_folder_name(self) -> str | None:
+        selected_indexes = self.table_widget.selectionModel().selectedRows()
+        if not selected_indexes:
+            return None
+        row = selected_indexes[0].row()
+        folder_item = self.table_widget.item(row, FOLDER_COLUMN)
+        if folder_item is None:
+            return None
+        folder_name = folder_item.data(Qt.ItemDataRole.UserRole)
+        return folder_name if isinstance(folder_name, str) else None
+
+    def _get_repo_visibility_by_name(self) -> dict[str, str]:
+        repo_visibility_by_name: dict[str, str] = {}
+        for row in range(self.table_widget.rowCount()):
+            folder_item = self.table_widget.item(row, FOLDER_COLUMN)
+            repo_widget = self.table_widget.cellWidget(row, REPO_COLUMN)
+            if folder_item is None or not isinstance(repo_widget, QComboBox):
+                continue
+            folder_name = folder_item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(folder_name, str):
+                repo_visibility_by_name[folder_name] = repo_widget.currentText()
+        return repo_visibility_by_name
+
+
+class GitIgnoreDialog(QDialog):
+    def __init__(self, folder_path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.editor = QPlainTextEdit()
+        self.folder_path = folder_path
+        self.setWindowTitle(f"{folder_path.name} {GITIGNORE_FILE_NAME}")
+        self.resize(720, 520)
+        self.editor.setPlainText(read_gitignore_text(folder_path))
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        layout.addWidget(self.editor)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def get_text(self) -> str:
+        return self.editor.toPlainText()
 
 
 def get_current_folders() -> list[Path]:
@@ -579,8 +846,10 @@ def get_current_folder_names() -> list[str]:
     return [path.name for path in get_current_folders()]
 
 
-def get_folder_size_details(folder_path: Path) -> tuple[int, list[tuple[str, int]]]:
+def get_folder_metrics(folder_path: Path) -> FolderMetrics:
+    ignore_rules = load_gitignore_rules(folder_path)
     total_size = 0
+    filtered_size = 0
     sizes_by_type: dict[str, int] = {}
     for current_root, dir_names, file_names in os.walk(folder_path):
         dir_names[:] = [
@@ -597,8 +866,11 @@ def get_folder_size_details(folder_path: Path) -> tuple[int, list[tuple[str, int
             total_size += file_size
             file_type = file_path.suffix.lower() or NO_EXTENSION_LABEL
             sizes_by_type[file_type] = sizes_by_type.get(file_type, 0) + file_size
+            relative_path = file_path.relative_to(folder_path).as_posix()
+            if not matches_gitignore(relative_path, ignore_rules):
+                filtered_size += file_size
     top_types = sorted(sizes_by_type.items(), key=lambda item: (-item[1], item[0]))[:3]
-    return total_size, top_types
+    return FolderMetrics(total_size, filtered_size, top_types)
 
 
 def format_size(size_in_bytes: int) -> str:
@@ -617,6 +889,32 @@ def format_top_types(total_size: int, top_types: list[tuple[str, int]]) -> str:
         f"{file_type} {file_size / total_size * 100:.1f}%"
         for file_type, file_size in top_types
     )
+
+
+def format_top_types_html(total_size: int, top_types: list[tuple[str, int]]) -> str:
+    if not total_size or not top_types:
+        return "No files"
+    parts: list[str] = []
+    for file_type, file_size in top_types:
+        percentage = file_size / total_size * 100
+        if file_type.startswith("."):
+            parts.append(
+                f'<a href="{html.escape(file_type)}">{html.escape(file_type)} {percentage:.1f}%</a>'
+            )
+        else:
+            parts.append(f"{html.escape(file_type)} {percentage:.1f}%")
+    return " | ".join(parts)
+
+
+def create_size_item(size_in_bytes: int) -> SortableTableWidgetItem:
+    size_item = SortableTableWidgetItem(format_size(size_in_bytes))
+    size_item.setData(Qt.ItemDataRole.UserRole, size_in_bytes)
+    size_item.setFlags(
+        (size_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        | Qt.ItemFlag.ItemIsEnabled
+        | Qt.ItemFlag.ItemIsSelectable
+    )
+    return size_item
 
 
 def normalize_folder_name(folder_name: str) -> str:
@@ -643,6 +941,104 @@ def get_temporary_rename_path(parent_path: Path, target_name: str) -> Path:
         temporary_path = parent_path / f"{target_name}.tmp-rename-{suffix}"
         suffix += 1
     return temporary_path
+
+
+def get_repo_visibility_flag(repo_visibility: str) -> str:
+    return (
+        "--public"
+        if repo_visibility == REPO_VISIBILITY_PUBLIC
+        else "--private"
+    )
+
+
+def read_gitignore_text(folder_path: Path) -> str:
+    gitignore_path = folder_path / GITIGNORE_FILE_NAME
+    if not gitignore_path.exists():
+        return ""
+    return gitignore_path.read_text(encoding="utf-8")
+
+
+def write_gitignore_text(folder_path: Path, text: str) -> None:
+    gitignore_path = folder_path / GITIGNORE_FILE_NAME
+    normalized_text = text.replace("\r\n", "\n")
+    gitignore_path.write_text(normalized_text, encoding="utf-8")
+
+
+def add_gitignore_pattern(folder_path: Path, pattern: str) -> bool:
+    lines = read_gitignore_lines(folder_path)
+    if pattern in lines:
+        return False
+    lines.append(pattern)
+    write_gitignore_text(folder_path, "\n".join(lines).rstrip("\n") + "\n")
+    return True
+
+
+def read_gitignore_lines(folder_path: Path) -> list[str]:
+    text = read_gitignore_text(folder_path)
+    if not text:
+        return []
+    return text.replace("\r\n", "\n").split("\n")[:-1] if text.endswith("\n") else text.replace("\r\n", "\n").split("\n")
+
+
+def build_extension_ignore_pattern(file_type: str) -> str:
+    return f"{GITIGNORE_WILDCARD_PREFIX}{file_type}"
+
+
+def load_gitignore_rules(folder_path: Path) -> list[IgnoreRule]:
+    rules: list[IgnoreRule] = []
+    for raw_line in read_gitignore_lines(folder_path):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        negated = line.startswith("!")
+        if negated:
+            line = line[1:]
+        rooted = line.startswith("/")
+        if rooted:
+            line = line[1:]
+        directory_only = line.endswith("/")
+        if directory_only:
+            line = line[:-1]
+        line = line.strip()
+        if line:
+            rules.append(IgnoreRule(line.replace("\\", "/"), negated, directory_only, rooted))
+    return rules
+
+
+def matches_gitignore(relative_path: str, rules: list[IgnoreRule]) -> bool:
+    normalized_path = relative_path.strip("/").replace("\\", "/")
+    if not normalized_path:
+        return False
+    ignored = False
+    for rule in rules:
+        candidates = get_path_candidates(normalized_path)
+        if any(rule_matches_path(rule, candidate) for candidate in candidates):
+            ignored = not rule.negated
+    return ignored
+
+
+def get_directory_candidates(relative_path: str) -> list[str]:
+    parts = PurePosixPath(relative_path).parts
+    return ["/".join(parts[:index]) for index in range(1, len(parts))]
+
+
+def get_path_candidates(relative_path: str) -> list[str]:
+    return [relative_path, *get_directory_candidates(relative_path)]
+
+
+def rule_matches_path(rule: IgnoreRule, relative_path: str) -> bool:
+    path_parts = PurePosixPath(relative_path).parts
+    candidates = get_match_candidates(relative_path, rule.rooted)
+    if "/" not in rule.pattern and not rule.rooted:
+        return any(fnmatch(path_part, rule.pattern) for path_part in path_parts)
+    return any(fnmatch(candidate, rule.pattern) for candidate in candidates)
+
+
+def get_match_candidates(relative_path: str, rooted: bool) -> list[str]:
+    if rooted:
+        return [relative_path]
+    parts = PurePosixPath(relative_path).parts
+    return ["/".join(parts[index:]) for index in range(len(parts))]
 
 
 def run_command(command: list[str], working_path: Path) -> subprocess.CompletedProcess[str]:
