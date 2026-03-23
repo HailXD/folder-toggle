@@ -346,6 +346,7 @@ class FolderToggleWindow(QWidget):
         self.is_updating = True
         self.table_widget.setSortingEnabled(False)
         self.table_widget.setRowCount(0)
+        load_errors: list[str] = []
         folder_paths = get_current_folders()
         self.store.sync_folder_names(path.name for path in folder_paths)
         folder_rows = self.store.fetch_all()
@@ -357,56 +358,75 @@ class FolderToggleWindow(QWidget):
             for name, _enabled, repo_visibility in folder_rows
         }
         for folder_path in folder_paths:
-            metrics = get_folder_metrics(folder_path)
-            row_index = self.table_widget.rowCount()
-            self.table_widget.insertRow(row_index)
+            try:
+                metrics = get_folder_metrics(folder_path)
+                row_index = self.table_widget.rowCount()
+                self.table_widget.insertRow(row_index)
 
-            folder_item = QTableWidgetItem(folder_path.name)
-            folder_item.setFlags(
-                (folder_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-            )
-            folder_item.setCheckState(
-                Qt.CheckState.Checked
-                if enabled_by_name.get(folder_path.name, False)
-                else Qt.CheckState.Unchecked
-            )
-            folder_item.setData(Qt.ItemDataRole.UserRole, folder_path.name)
-            self.table_widget.setItem(row_index, FOLDER_COLUMN, folder_item)
+                folder_item = QTableWidgetItem(folder_path.name)
+                folder_item.setFlags(
+                    (folder_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                )
+                folder_item.setCheckState(
+                    Qt.CheckState.Checked
+                    if enabled_by_name.get(folder_path.name, False)
+                    else Qt.CheckState.Unchecked
+                )
+                folder_item.setData(Qt.ItemDataRole.UserRole, folder_path.name)
+                self.table_widget.setItem(row_index, FOLDER_COLUMN, folder_item)
 
-            self.table_widget.setItem(
-                row_index, SIZE_COLUMN, create_size_item(metrics.total_size)
-            )
-            self.table_widget.setItem(
-                row_index,
-                FILTERED_SIZE_COLUMN,
-                create_size_item(metrics.filtered_size),
-            )
-            self.table_widget.setCellWidget(
-                row_index,
-                TYPE_COLUMN,
-                self._create_top_types_label(folder_path, metrics),
-            )
-            self.table_widget.setCellWidget(
-                row_index,
-                REPO_COLUMN,
-                self._create_repo_visibility_combo(
-                    folder_path.name,
-                    visibility_by_name.get(folder_path.name, REPO_VISIBILITY_PRIVATE),
-                ),
-            )
-            self.activity_label.setText(
-                f"Loading {row_index + 1} of {len(folder_paths)}: {folder_path.name}"
-            )
+                self.table_widget.setItem(
+                    row_index, SIZE_COLUMN, create_size_item(metrics.total_size)
+                )
+                self.table_widget.setItem(
+                    row_index,
+                    FILTERED_SIZE_COLUMN,
+                    create_size_item(metrics.filtered_size),
+                )
+                self.table_widget.setCellWidget(
+                    row_index,
+                    TYPE_COLUMN,
+                    self._create_top_types_label(folder_path, metrics),
+                )
+                self.table_widget.setCellWidget(
+                    row_index,
+                    REPO_COLUMN,
+                    self._create_repo_visibility_combo(
+                        folder_path.name,
+                        visibility_by_name.get(
+                            folder_path.name, REPO_VISIBILITY_PRIVATE
+                        ),
+                    ),
+                )
+                self.activity_label.setText(
+                    f"Loading {row_index + 1} of {len(folder_paths)}: {folder_path.name}"
+                )
+            except Exception as error:
+                load_errors.append(f"{folder_path.name}: {error}")
+                self.activity_label.setText(
+                    f"Skipped {folder_path.name}: {type(error).__name__}"
+                )
             QApplication.processEvents()
 
         self.is_updating = False
         self.table_widget.setSortingEnabled(True)
         self._apply_sort()
         self._update_status_label(len(folder_paths))
-        self.activity_label.setText("Ready")
+        if load_errors:
+            error_summary = "\n".join(load_errors[:8])
+            QMessageBox.warning(
+                self,
+                WINDOW_TITLE,
+                f"Loaded with {len(load_errors)} skipped folders.\n\n{error_summary}",
+            )
+            self.activity_label.setText(
+                f"Ready with {len(load_errors)} skipped folders"
+            )
+        else:
+            self.activity_label.setText("Ready")
 
     def _update_status_label(self, count: int | None = None) -> None:
         item_count = self.table_widget.rowCount() if count is None else count
@@ -993,7 +1013,10 @@ def read_gitignore_text(folder_path: Path) -> str:
     gitignore_path = folder_path / GITIGNORE_FILE_NAME
     if not gitignore_path.exists():
         return ""
-    return gitignore_path.read_text(encoding="utf-8")
+    try:
+        return gitignore_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ""
 
 
 def write_gitignore_text(folder_path: Path, text: str) -> None:
