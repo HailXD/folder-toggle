@@ -1,2 +1,4 @@
 *.pyc
 test.db
+__pycache__/
+folder-toggle-errors.log
