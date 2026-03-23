@@ -10,7 +10,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Iterable
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -212,7 +212,7 @@ class FolderToggleWindow(QWidget):
         self.is_updating = False
         self.table_widget = QTableWidget()
         self.status_label = QLabel()
-        self.activity_label = QLabel("Ready")
+        self.activity_label = QLabel("Loading folders...")
         self.enable_all_button = QPushButton("Enable All")
         self.disable_all_button = QPushButton("Disable All")
         self.toggle_all_button = QPushButton("Toggle All")
@@ -223,7 +223,7 @@ class FolderToggleWindow(QWidget):
         self.add_common_ignores_button = QPushButton("Add node_modules and *.pyc")
         self.sort_combo = QComboBox()
         self._build_ui()
-        self._load_items()
+        QTimer.singleShot(0, self._load_items)
 
     def _build_ui(self) -> None:
         self.setWindowTitle(WINDOW_TITLE)
@@ -397,11 +397,16 @@ class FolderToggleWindow(QWidget):
                     visibility_by_name.get(folder_path.name, REPO_VISIBILITY_PRIVATE),
                 ),
             )
+            self.activity_label.setText(
+                f"Loading {row_index + 1} of {len(folder_paths)}: {folder_path.name}"
+            )
+            QApplication.processEvents()
 
         self.is_updating = False
         self.table_widget.setSortingEnabled(True)
         self._apply_sort()
         self._update_status_label(len(folder_paths))
+        self.activity_label.setText("Ready")
 
     def _update_status_label(self, count: int | None = None) -> None:
         item_count = self.table_widget.rowCount() if count is None else count
