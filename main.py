@@ -4,6 +4,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
@@ -58,6 +59,7 @@ GITIGNORE_FILE_NAME = ".gitignore"
 GITIGNORE_WILDCARD_PREFIX = "*"
 NODE_MODULES_IGNORE_PATTERN = "node_modules/"
 PYC_IGNORE_PATTERN = "*.pyc"
+ERROR_LOG_PATH = APP_DIR / "folder-toggle-errors.log"
 
 
 @dataclass(slots=True)
@@ -222,8 +224,14 @@ class FolderToggleWindow(QWidget):
         self.edit_gitignore_button = QPushButton("Edit .gitignore")
         self.add_common_ignores_button = QPushButton("Add node_modules and *.pyc")
         self.sort_combo = QComboBox()
+        self.folder_paths_to_load: list[Path] = []
+        self.load_errors: list[str] = []
+        self.load_index = 0
+        self.load_token = 0
+        self.enabled_by_name: dict[str, bool] = {}
+        self.visibility_by_name: dict[str, str] = {}
         self._build_ui()
-        QTimer.singleShot(0, self._load_items)
+        QTimer.singleShot(0, self._load_items_safe)
 
     def _build_ui(self) -> None:
         self.setWindowTitle(WINDOW_TITLE)
@@ -342,91 +350,133 @@ class FolderToggleWindow(QWidget):
         self.table_widget.itemChanged.connect(self._handle_item_changed)
         self.table_widget.cellDoubleClicked.connect(self._handle_cell_double_clicked)
 
+    def _load_items_safe(self) -> None:
+        try:
+            self._load_items()
+        except Exception as error:
+            self._handle_unexpected_error("initial load", error)
+
     def _load_items(self) -> None:
         self.is_updating = True
         self.table_widget.setSortingEnabled(False)
         self.table_widget.setRowCount(0)
-        load_errors: list[str] = []
-        folder_paths = get_current_folders()
-        self.store.sync_folder_names(path.name for path in folder_paths)
+        self.load_token += 1
+        self.load_errors = []
+        self.load_index = 0
+        self.folder_paths_to_load = get_current_folders()
+        self.store.sync_folder_names(path.name for path in self.folder_paths_to_load)
         folder_rows = self.store.fetch_all()
-        enabled_by_name = {
+        self.enabled_by_name = {
             name: enabled for name, enabled, _repo_visibility in folder_rows
         }
-        visibility_by_name = {
+        self.visibility_by_name = {
             name: repo_visibility
             for name, _enabled, repo_visibility in folder_rows
         }
-        for folder_path in folder_paths:
-            try:
-                metrics = get_folder_metrics(folder_path)
-                row_index = self.table_widget.rowCount()
-                self.table_widget.insertRow(row_index)
+        if not self.folder_paths_to_load:
+            self._finish_loading(self.load_token)
+            return
+        self.activity_label.setText(f"Loading 0 of {len(self.folder_paths_to_load)}")
+        current_token = self.load_token
+        QTimer.singleShot(0, lambda: self._load_next_folder(current_token))
 
-                folder_item = QTableWidgetItem(folder_path.name)
-                folder_item.setFlags(
-                    (folder_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    | Qt.ItemFlag.ItemIsUserCheckable
-                    | Qt.ItemFlag.ItemIsEnabled
-                    | Qt.ItemFlag.ItemIsSelectable
-                )
-                folder_item.setCheckState(
-                    Qt.CheckState.Checked
-                    if enabled_by_name.get(folder_path.name, False)
-                    else Qt.CheckState.Unchecked
-                )
-                folder_item.setData(Qt.ItemDataRole.UserRole, folder_path.name)
-                self.table_widget.setItem(row_index, FOLDER_COLUMN, folder_item)
+    def _load_next_folder(self, token: int) -> None:
+        if token != self.load_token:
+            return
+        if self.load_index >= len(self.folder_paths_to_load):
+            self._finish_loading(token)
+            return
 
-                self.table_widget.setItem(
-                    row_index, SIZE_COLUMN, create_size_item(metrics.total_size)
-                )
-                self.table_widget.setItem(
-                    row_index,
-                    FILTERED_SIZE_COLUMN,
-                    create_size_item(metrics.filtered_size),
-                )
-                self.table_widget.setCellWidget(
-                    row_index,
-                    TYPE_COLUMN,
-                    self._create_top_types_label(folder_path, metrics),
-                )
-                self.table_widget.setCellWidget(
-                    row_index,
-                    REPO_COLUMN,
-                    self._create_repo_visibility_combo(
-                        folder_path.name,
-                        visibility_by_name.get(
-                            folder_path.name, REPO_VISIBILITY_PRIVATE
-                        ),
-                    ),
-                )
-                self.activity_label.setText(
-                    f"Loading {row_index + 1} of {len(folder_paths)}: {folder_path.name}"
-                )
-            except Exception as error:
-                load_errors.append(f"{folder_path.name}: {error}")
-                self.activity_label.setText(
-                    f"Skipped {folder_path.name}: {type(error).__name__}"
-                )
-            QApplication.processEvents()
+        folder_path = self.folder_paths_to_load[self.load_index]
+        try:
+            metrics = get_folder_metrics(folder_path)
+            self._append_folder_row(folder_path, metrics)
+            self.activity_label.setText(
+                f"Loading {self.load_index + 1} of {len(self.folder_paths_to_load)}: {folder_path.name}"
+            )
+        except Exception as error:
+            self.load_errors.append(f"{folder_path.name}: {error}")
+            log_exception(error, f"load folder {folder_path}")
+            self.activity_label.setText(
+                f"Skipped {folder_path.name}: {type(error).__name__}"
+            )
 
+        self.load_index += 1
+        QTimer.singleShot(0, lambda: self._load_next_folder(token))
+
+    def _append_folder_row(self, folder_path: Path, metrics: FolderMetrics) -> None:
+        row_index = self.table_widget.rowCount()
+        self.table_widget.insertRow(row_index)
+
+        folder_item = QTableWidgetItem(folder_path.name)
+        folder_item.setFlags(
+            (folder_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            | Qt.ItemFlag.ItemIsUserCheckable
+            | Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+        )
+        folder_item.setCheckState(
+            Qt.CheckState.Checked
+            if self.enabled_by_name.get(folder_path.name, False)
+            else Qt.CheckState.Unchecked
+        )
+        folder_item.setData(Qt.ItemDataRole.UserRole, folder_path.name)
+        self.table_widget.setItem(row_index, FOLDER_COLUMN, folder_item)
+
+        self.table_widget.setItem(
+            row_index, SIZE_COLUMN, create_size_item(metrics.total_size)
+        )
+        self.table_widget.setItem(
+            row_index,
+            FILTERED_SIZE_COLUMN,
+            create_size_item(metrics.filtered_size),
+        )
+        self.table_widget.setCellWidget(
+            row_index,
+            TYPE_COLUMN,
+            self._create_top_types_label(folder_path, metrics),
+        )
+        self.table_widget.setCellWidget(
+            row_index,
+            REPO_COLUMN,
+            self._create_repo_visibility_combo(
+                folder_path.name,
+                self.visibility_by_name.get(
+                    folder_path.name, REPO_VISIBILITY_PRIVATE
+                ),
+            ),
+        )
+
+    def _finish_loading(self, token: int) -> None:
+        if token != self.load_token:
+            return
         self.is_updating = False
         self.table_widget.setSortingEnabled(True)
         self._apply_sort()
-        self._update_status_label(len(folder_paths))
-        if load_errors:
-            error_summary = "\n".join(load_errors[:8])
+        self._update_status_label(len(self.folder_paths_to_load))
+        if self.load_errors:
+            error_summary = "\n".join(self.load_errors[:8])
             QMessageBox.warning(
                 self,
                 WINDOW_TITLE,
-                f"Loaded with {len(load_errors)} skipped folders.\n\n{error_summary}",
+                f"Loaded with {len(self.load_errors)} skipped folders.\n\n{error_summary}\n\nDetails: {ERROR_LOG_PATH}",
             )
             self.activity_label.setText(
-                f"Ready with {len(load_errors)} skipped folders"
+                f"Ready with {len(self.load_errors)} skipped folders"
             )
         else:
             self.activity_label.setText("Ready")
+
+    def _handle_unexpected_error(self, context: str, error: Exception) -> None:
+        log_exception(error, context)
+        self.is_updating = False
+        self.table_widget.setSortingEnabled(True)
+        QMessageBox.critical(
+            self,
+            WINDOW_TITLE,
+            f"Unexpected error during {context}.\n\nDetails: {ERROR_LOG_PATH}",
+        )
+        self.activity_label.setText(f"Error during {context}")
 
     def _update_status_label(self, count: int | None = None) -> None:
         item_count = self.table_widget.rowCount() if count is None else count
@@ -810,7 +860,11 @@ class FolderToggleWindow(QWidget):
         if not folder_path.is_dir():
             self._load_items()
             return
-        metrics = get_folder_metrics(folder_path)
+        try:
+            metrics = get_folder_metrics(folder_path)
+        except Exception as error:
+            self._handle_unexpected_error(f"refreshing {folder_name}", error)
+            return
         self.is_updating = True
         self.table_widget.item(row, SIZE_COLUMN).setText(format_size(metrics.total_size))
         self.table_widget.item(row, SIZE_COLUMN).setData(
@@ -1126,6 +1180,32 @@ def get_match_candidates(relative_path: str, rooted: bool) -> list[str]:
     return ["/".join(parts[index:]) for index in range(len(parts))]
 
 
+def log_exception(error: Exception, context: str) -> None:
+    try:
+        with ERROR_LOG_PATH.open("a", encoding="utf-8") as file_handle:
+            file_handle.write(f"[{context}] {type(error).__name__}: {error}\n")
+            file_handle.write(traceback.format_exc())
+            file_handle.write("\n")
+    except OSError:
+        return
+
+
+def handle_uncaught_exception(
+    exc_type: type[BaseException],
+    exc_value: BaseException,
+    exc_traceback,
+) -> None:
+    try:
+        with ERROR_LOG_PATH.open("a", encoding="utf-8") as file_handle:
+            file_handle.write("[uncaught exception]\n")
+            file_handle.write(
+                "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+            )
+            file_handle.write("\n")
+    except OSError:
+        return
+
+
 def run_command(command: list[str], working_path: Path) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -1168,6 +1248,7 @@ def get_current_branch_name(folder_path: Path) -> str:
 
 
 def main() -> int:
+    sys.excepthook = handle_uncaught_exception
     store = FolderStore(DB_PATH)
     store.seed_if_empty(get_current_folder_names())
     app = QApplication(sys.argv)
